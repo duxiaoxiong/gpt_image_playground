@@ -1,4 +1,5 @@
-import type { AppSettings, ImageApiResponse, TaskParams } from '../types'
+import type { AppSettings, ImageApiResponse, ResponsesApiResponse, TaskParams } from '../types'
+import { dataUrlToBlob, imageDataUrlToPngBlob, maskDataUrlToPngBlob } from './canvasImage'
 import { buildApiUrl, readClientDevProxyConfig } from './devProxy'
 
 const MIME_MAP: Record<string, string> = {
@@ -42,29 +43,203 @@ async function fetchImageUrlAsDataUrl(url: string, fallbackMime: string, signal:
   return blobToDataUrl(await response.blob(), fallbackMime)
 }
 
+async function getApiErrorMessage(response: Response): Promise<string> {
+  let errorMsg = `HTTP ${response.status}`
+  try {
+    const errJson = await response.json()
+    if (errJson.error?.message) errorMsg = errJson.error.message
+    else if (errJson.message) errorMsg = errJson.message
+  } catch {
+    try {
+      errorMsg = await response.text()
+    } catch {
+      /* ignore */
+    }
+  }
+  return errorMsg
+}
+
+function createRequestHeaders(settings: AppSettings): Record<string, string> {
+  return {
+    Authorization: `Bearer ${settings.apiKey}`,
+    'Cache-Control': 'no-store, no-cache, max-age=0',
+    Pragma: 'no-cache',
+  }
+}
+
+function createResponsesImageTool(params: TaskParams, isEdit: boolean, settings: AppSettings): Record<string, unknown> {
+  const tool: Record<string, unknown> = {
+    type: 'image_generation',
+    action: isEdit ? 'edit' : 'generate',
+    size: params.size,
+    output_format: params.output_format,
+  }
+
+  if (!settings.codexCli) {
+    tool.quality = params.quality
+  }
+
+  if (params.output_format !== 'png' && params.output_compression != null) {
+    tool.output_compression = params.output_compression
+  }
+
+  return tool
+}
+
+function createResponsesInput(prompt: string, inputImageDataUrls: string[]): unknown {
+  const text = `Use the following text as the complete prompt. Do not rewrite it:\n${prompt}`
+  if (!inputImageDataUrls.length) return text
+
+  return [
+    {
+      role: 'user',
+      content: [
+        { type: 'input_text', text },
+        ...inputImageDataUrls.map((dataUrl) => ({
+          type: 'input_image',
+          image_url: dataUrl,
+        })),
+      ],
+    },
+  ]
+}
+
 export interface CallApiOptions {
   settings: AppSettings
   prompt: string
   params: TaskParams
   /** 输入图片的 data URL 列表 */
   inputImageDataUrls: string[]
+  /** 与第一张输入图片同尺寸的 PNG 遮罩；透明区域会被编辑 */
+  maskDataUrl?: string
 }
 
 export interface CallApiResult {
   /** base64 data URL 列表 */
   images: string[]
+  /** API 返回的实际生效参数 */
+  actualParams?: Partial<TaskParams>
+  /** 每张图片对应的实际生效参数 */
+  actualParamsList?: Array<Partial<TaskParams> | undefined>
+  /** 每张图片对应的 API 改写提示词 */
+  revisedPrompts?: Array<string | undefined>
+}
+
+function parseResponsesImageResults(payload: ResponsesApiResponse, fallbackMime: string): Array<{
+  image: string
+  actualParams?: Partial<TaskParams>
+  revisedPrompt?: string
+}> {
+  const output = payload.output
+  if (!Array.isArray(output) || !output.length) {
+    throw new Error('接口未返回图片数据')
+  }
+
+  const results: Array<{ image: string; actualParams?: Partial<TaskParams>; revisedPrompt?: string }> = []
+
+  for (const item of output) {
+    if (item?.type !== 'image_generation_call') continue
+
+    const result = item.result
+    if (typeof result === 'string' && result.trim()) {
+      results.push({
+        image: normalizeBase64Image(result, fallbackMime),
+        actualParams: mergeActualParams(pickActualParams(item)),
+        revisedPrompt: typeof item.revised_prompt === 'string' ? item.revised_prompt : undefined,
+      })
+    }
+  }
+
+  if (!results.length) {
+    throw new Error('接口未返回可用图片数据')
+  }
+
+  return results
+}
+
+function pickActualParams(source: unknown): Partial<TaskParams> {
+  if (!source || typeof source !== 'object') return {}
+  const record = source as Record<string, unknown>
+  const actualParams: Partial<TaskParams> = {}
+
+  if (typeof record.size === 'string') actualParams.size = record.size
+  if (record.quality === 'auto' || record.quality === 'low' || record.quality === 'medium' || record.quality === 'high') {
+    actualParams.quality = record.quality
+  }
+  if (record.output_format === 'png' || record.output_format === 'jpeg' || record.output_format === 'webp') {
+    actualParams.output_format = record.output_format
+  }
+  if (typeof record.output_compression === 'number') actualParams.output_compression = record.output_compression
+  if (record.moderation === 'auto' || record.moderation === 'low') actualParams.moderation = record.moderation
+  if (typeof record.n === 'number') actualParams.n = record.n
+
+  return actualParams
+}
+
+function mergeActualParams(...sources: Array<Partial<TaskParams>>): Partial<TaskParams> | undefined {
+  const merged = Object.assign({}, ...sources.filter((source) => Object.keys(source).length))
+  return Object.keys(merged).length ? merged : undefined
 }
 
 export async function callImageApi(opts: CallApiOptions): Promise<CallApiResult> {
-  const { settings, prompt, params, inputImageDataUrls } = opts
+  if (opts.maskDataUrl && opts.settings.apiMode === 'responses') {
+    throw new Error('遮罩编辑当前仅支持 Images API，请在设置中切换 API 模式')
+  }
+
+  return opts.settings.apiMode === 'responses'
+    ? callResponsesImageApi(opts)
+    : callImagesApi(opts)
+}
+
+async function callImagesApi(opts: CallApiOptions): Promise<CallApiResult> {
+  const n = opts.params.n > 0 ? opts.params.n : 1
+  if (opts.settings.codexCli && n > 1) {
+    return callImagesApiConcurrent(opts, n)
+  }
+
+  return callImagesApiSingle(opts)
+}
+
+async function callImagesApiConcurrent(opts: CallApiOptions, n: number): Promise<CallApiResult> {
+  const singleOpts = { ...opts, params: { ...opts.params, n: 1, quality: 'auto' as const } }
+  const results = await Promise.allSettled(
+    Array.from({ length: n }).map(() => callImagesApiSingle(singleOpts)),
+  )
+
+  const successfulResults = results
+    .filter((r): r is PromiseFulfilledResult<CallApiResult> => r.status === 'fulfilled')
+    .map((r) => r.value)
+
+  if (successfulResults.length === 0) {
+    const firstError = results.find((r): r is PromiseRejectedResult => r.status === 'rejected')
+    if (firstError) throw firstError.reason
+    throw new Error('所有并发请求均失败')
+  }
+
+  const images = successfulResults.flatMap((r) => r.images)
+  const actualParamsList = successfulResults.flatMap((r) =>
+    r.actualParamsList?.length ? r.actualParamsList : r.images.map(() => r.actualParams),
+  )
+  const revisedPrompts = successfulResults.flatMap((r) =>
+    r.revisedPrompts?.length ? r.revisedPrompts : r.images.map(() => undefined),
+  )
+  const actualParams = mergeActualParams(
+    successfulResults[0]?.actualParams ?? {},
+    { quality: 'auto', n: images.length },
+  )
+
+  return { images, actualParams, actualParamsList, revisedPrompts }
+}
+
+async function callImagesApiSingle(opts: CallApiOptions): Promise<CallApiResult> {
+  const { settings, prompt: originalPrompt, params, inputImageDataUrls, maskDataUrl } = opts
+  const prompt = settings.codexCli
+    ? `Use the following text as the complete prompt. Do not rewrite it:\n${originalPrompt}`
+    : originalPrompt
   const isEdit = inputImageDataUrls.length > 0
   const mime = MIME_MAP[params.output_format] || 'image/png'
   const proxyConfig = readClientDevProxyConfig()
-  const requestHeaders = {
-    Authorization: `Bearer ${settings.apiKey}`,
-    'Cache-Control': 'no-store, no-cache, max-age=0',
-    Pragma: 'no-cache',
-  }
+  const requestHeaders = createRequestHeaders(settings)
 
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), settings.timeout * 1000)
@@ -77,9 +252,12 @@ export async function callImageApi(opts: CallApiOptions): Promise<CallApiResult>
       formData.append('model', settings.model)
       formData.append('prompt', prompt)
       formData.append('size', params.size)
-      formData.append('quality', params.quality)
       formData.append('output_format', params.output_format)
       formData.append('moderation', params.moderation)
+
+      if (!settings.codexCli) {
+        formData.append('quality', params.quality)
+      }
 
       if (params.output_format !== 'png' && params.output_compression != null) {
         formData.append('output_compression', String(params.output_compression))
@@ -87,10 +265,14 @@ export async function callImageApi(opts: CallApiOptions): Promise<CallApiResult>
 
       for (let i = 0; i < inputImageDataUrls.length; i++) {
         const dataUrl = inputImageDataUrls[i]
-        const resp = await fetch(dataUrl)
-        const blob = await resp.blob()
+        const blob = maskDataUrl && i === 0
+          ? await imageDataUrlToPngBlob(dataUrl)
+          : await dataUrlToBlob(dataUrl)
         const ext = blob.type.split('/')[1] || 'png'
         formData.append('image[]', blob, `input-${i + 1}.${ext}`)
+      }
+      if (maskDataUrl) {
+        formData.append('mask', await maskDataUrlToPngBlob(maskDataUrl), 'mask.png')
       }
 
       response = await fetch(buildApiUrl(settings.baseUrl, 'images/edits', proxyConfig), {
@@ -105,9 +287,12 @@ export async function callImageApi(opts: CallApiOptions): Promise<CallApiResult>
         model: settings.model,
         prompt,
         size: params.size,
-        quality: params.quality,
         output_format: params.output_format,
         moderation: params.moderation,
+      }
+
+      if (!settings.codexCli) {
+        body.quality = params.quality
       }
 
       if (params.output_format !== 'png' && params.output_compression != null) {
@@ -130,19 +315,7 @@ export async function callImageApi(opts: CallApiOptions): Promise<CallApiResult>
     }
 
     if (!response.ok) {
-      let errorMsg = `HTTP ${response.status}`
-      try {
-        const errJson = await response.json()
-        if (errJson.error?.message) errorMsg = errJson.error.message
-        else if (errJson.message) errorMsg = errJson.message
-      } catch {
-        try {
-          errorMsg = await response.text()
-        } catch {
-          /* ignore */
-        }
-      }
-      throw new Error(errorMsg)
+      throw new Error(await getApiErrorMessage(response))
     }
 
     const payload = await response.json() as ImageApiResponse
@@ -152,15 +325,18 @@ export async function callImageApi(opts: CallApiOptions): Promise<CallApiResult>
     }
 
     const images: string[] = []
+    const revisedPrompts: Array<string | undefined> = []
     for (const item of data) {
       const b64 = item.b64_json
       if (b64) {
         images.push(normalizeBase64Image(b64, mime))
+        revisedPrompts.push(typeof item.revised_prompt === 'string' ? item.revised_prompt : undefined)
         continue
       }
 
       if (isHttpUrl(item.url)) {
         images.push(await fetchImageUrlAsDataUrl(item.url, mime, controller.signal))
+        revisedPrompts.push(typeof item.revised_prompt === 'string' ? item.revised_prompt : undefined)
       }
     }
 
@@ -168,7 +344,100 @@ export async function callImageApi(opts: CallApiOptions): Promise<CallApiResult>
       throw new Error('接口未返回可用图片数据')
     }
 
-    return { images }
+    const actualParams = mergeActualParams(
+      pickActualParams(payload),
+      settings.codexCli ? { quality: 'auto' } : {},
+    )
+    return {
+      images,
+      actualParams,
+      actualParamsList: images.map(() => actualParams),
+      revisedPrompts,
+    }
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+async function callResponsesImageApi(opts: CallApiOptions): Promise<CallApiResult> {
+  const n = opts.params.n > 0 ? opts.params.n : 1
+  if (n === 1) {
+    return callResponsesImageApiSingle(opts)
+  }
+
+  const promises = Array.from({ length: n }).map(() => callResponsesImageApiSingle(opts))
+  const results = await Promise.allSettled(promises)
+  
+  const successfulResults = results
+    .filter((r): r is PromiseFulfilledResult<CallApiResult> => r.status === 'fulfilled')
+    .map((r) => r.value)
+
+  if (successfulResults.length === 0) {
+    const firstError = results.find((r): r is PromiseRejectedResult => r.status === 'rejected')
+    if (firstError) throw firstError.reason
+    throw new Error('所有并发请求均失败')
+  }
+
+  const images = successfulResults.flatMap((r) => r.images)
+  const actualParamsList = successfulResults.flatMap((r) =>
+    r.actualParamsList?.length ? r.actualParamsList : r.images.map(() => r.actualParams),
+  )
+  const revisedPrompts = successfulResults.flatMap((r) =>
+    r.revisedPrompts?.length ? r.revisedPrompts : r.images.map(() => undefined),
+  )
+  const actualParams = mergeActualParams(
+    successfulResults[0]?.actualParams ?? {},
+    images.length === opts.params.n ? { n: opts.params.n } : { n: images.length },
+  )
+
+  return { images, actualParams, actualParamsList, revisedPrompts }
+}
+
+async function callResponsesImageApiSingle(opts: CallApiOptions): Promise<CallApiResult> {
+  const { settings, prompt, params, inputImageDataUrls } = opts
+  const mime = MIME_MAP[params.output_format] || 'image/png'
+  const proxyConfig = readClientDevProxyConfig()
+  const requestHeaders = createRequestHeaders(settings)
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), settings.timeout * 1000)
+
+  try {
+    const body = {
+      model: settings.model,
+      input: createResponsesInput(prompt, inputImageDataUrls),
+      tools: [createResponsesImageTool(params, inputImageDataUrls.length > 0, settings)],
+      tool_choice: 'required',
+    }
+
+    const response = await fetch(buildApiUrl(settings.baseUrl, 'responses', proxyConfig), {
+      method: 'POST',
+      headers: {
+        ...requestHeaders,
+        'Content-Type': 'application/json',
+      },
+      cache: 'no-store',
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+
+    if (!response.ok) {
+      throw new Error(await getApiErrorMessage(response))
+    }
+
+    const payload = await response.json() as ResponsesApiResponse
+    const imageResults = parseResponsesImageResults(payload, mime)
+    const actualParams = mergeActualParams(
+      imageResults[0]?.actualParams ?? {},
+      settings.codexCli ? { quality: 'auto' } : {},
+    )
+    return {
+      images: imageResults.map((result) => result.image),
+      actualParams,
+      actualParamsList: imageResults.map((result) =>
+        mergeActualParams(result.actualParams ?? {}, settings.codexCli ? { quality: 'auto' } : {}),
+      ),
+      revisedPrompts: imageResults.map((result) => result.revisedPrompt),
+    }
   } finally {
     clearTimeout(timeoutId)
   }
