@@ -3,6 +3,7 @@ import type { TaskRecord } from '../types'
 import { useStore, getCachedImage, ensureImageCached, updateTaskInStore, retryTask } from '../store'
 import { formatImageRatio } from '../lib/size'
 import { ParamValue } from '../lib/paramDisplay'
+import { SAVEABLE_IMAGE_CLASS } from '../generatedImageCalloutStyles'
 
 interface Props {
   task: TaskRecord
@@ -275,7 +276,7 @@ export default function TaskCard({
             <>
               <img
                 src={thumbSrc}
-                className="w-full h-full object-cover"
+                className={`${SAVEABLE_IMAGE_CLASS} w-full h-full object-cover`}
                 loading="lazy"
                 alt=""
               />

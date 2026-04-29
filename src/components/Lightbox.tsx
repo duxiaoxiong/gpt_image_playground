@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useCallback } from 'react'
 import { useStore, getCachedImage, ensureImageCached } from '../store'
 import { useCloseOnEscape } from '../hooks/useCloseOnEscape'
 import { createMaskPreviewDataUrl } from '../lib/canvasImage'
+import { SAVEABLE_IMAGE_CLASS } from '../generatedImageCalloutStyles'
 
 const MIN_SCALE = 1
 const MAX_SCALE = 10
@@ -461,7 +462,7 @@ function LightboxInner({ src, maskPreviewSrc, onClose, showNav, currentIndex, to
         >
           <img
             src={src}
-            className="max-w-[85vw] max-h-[85vh] object-contain rounded-lg shadow-2xl"
+            className={`${SAVEABLE_IMAGE_CLASS} max-w-[85vw] max-h-[85vh] object-contain rounded-lg shadow-2xl`}
             onDragStart={(e) => e.preventDefault()}
             alt=""
           />

@@ -5,6 +5,7 @@ import { formatImageRatio } from '../lib/size'
 import { ActualValueBadge, DetailParamValue } from '../lib/paramDisplay'
 import { copyBlobToClipboard, copyTextToClipboard, getClipboardFailureMessage } from '../lib/clipboard'
 import { createMaskPreviewDataUrl } from '../lib/canvasImage'
+import { SAVEABLE_IMAGE_CLASS } from '../generatedImageCalloutStyles'
 
 export default function DetailModal() {
   const tasks = useStore((s) => s.tasks)
@@ -290,7 +291,7 @@ export default function DetailModal() {
               <img
                 ref={mainImageRef}
                 src={currentOutputImageSrc}
-                className="max-w-[calc(100%-2rem)] max-h-[calc(100%-2rem)] object-contain cursor-pointer"
+                className={`${SAVEABLE_IMAGE_CLASS} max-w-[calc(100%-2rem)] max-h-[calc(100%-2rem)] object-contain cursor-pointer`}
                 onLoad={() => {
                   const panel = imagePanelRef.current
                   const image = mainImageRef.current
